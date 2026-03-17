@@ -1,0 +1,12 @@
+playwright
+beautifulsoup4
+lxml
+httpx
+pandas
+pymupdf
+aiofiles
+tenacity
+loguru
+python-dotenv
+pytest
+pytest-asyncio
