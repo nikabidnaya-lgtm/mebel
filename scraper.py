@@ -26,6 +26,10 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
+# Явные локальные пути к Excel-файлам для запуска без передачи аргументов CLI.
+DEFAULT_INPUT_EXCEL_PATH = "data/input.xlsx"
+DEFAULT_OUTPUT_EXCEL_PATH = "data/output.xlsx"
+
 
 @dataclass
 class ScraperConfig:
@@ -111,11 +115,13 @@ class FurnitureScraper:
         all_rows: list[pd.DataFrame] = []
         for _, row in source.iterrows():
             query = {
-                "name": row.get("name") or row.get("original_name") or "",
-                "description": row.get("description", ""),
-                "size": row.get("size", ""),
-                "budget_max": int(row["budget_max"]) if not pd.isna(row.get("budget_max")) else None,
-                "keywords": self._parse_keywords(row.get("keywords", "")),
+                "name": self._pick_row_value(row, ["name", "original_name", "наименование", "название"]),
+                "description": self._pick_row_value(row, ["description", "описание", "характеристики"]),
+                "size": self._pick_row_value(row, ["size", "размер", "габариты"]),
+                "budget_max": self._parse_budget(row),
+                "keywords": self._parse_keywords(
+                    self._pick_row_value(row, ["keywords", "ключевые_слова", "ключевые слова"]) 
+                ),
             }
             df = await self.to_dataframe(query, max_results=max_results_per_row)
             all_rows.append(df)
@@ -364,6 +370,23 @@ class FurnitureScraper:
             return []
         return [x.strip() for x in str(raw).split(",") if x.strip()]
 
+    def _parse_budget(self, row: pd.Series) -> int | None:
+        raw = self._pick_row_value(row, ["budget_max", "budget", "max_price", "бюджет", "макс_бюджет"])
+        if raw is None or pd.isna(raw):
+            return None
+        digits = re.sub(r"\D", "", str(raw))
+        return int(digits) if digits else None
+
+    def _pick_row_value(self, row: pd.Series, aliases: list[str]) -> Any:
+        normalized = {str(col).strip().lower(): col for col in row.index}
+        for alias in aliases:
+            key = alias.strip().lower()
+            if key in normalized:
+                value = row.get(normalized[key])
+                if value is not None and not pd.isna(value):
+                    return value
+        return ""
+
     def _deduplicate(self, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
         seen: set[str] = set()
         out = []
@@ -391,8 +414,16 @@ async def _run_cli(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Скрейпер аналогов мебели")
-    parser.add_argument("--excel", required=True, help="Путь к входному Excel")
-    parser.add_argument("--output", required=True, help="Путь к выходному Excel")
+    parser.add_argument(
+        "--excel",
+        default=DEFAULT_INPUT_EXCEL_PATH,
+        help=f"Путь к входному Excel (по умолчанию: {DEFAULT_INPUT_EXCEL_PATH})",
+    )
+    parser.add_argument(
+        "--output",
+        default=DEFAULT_OUTPUT_EXCEL_PATH,
+        help=f"Путь к выходному Excel (по умолчанию: {DEFAULT_OUTPUT_EXCEL_PATH})",
+    )
     parser.add_argument("--max-results", type=int, default=5, help="Максимум аналогов на одну позицию")
     args = parser.parse_args()
     asyncio.run(_run_cli(args))

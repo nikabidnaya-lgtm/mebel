@@ -48,6 +48,24 @@ async def test_extract_description_from_html():
     assert "Эргономичное кресло" in desc
 
 
+@pytest.mark.asyncio
+async def test_row_aliases_and_budget_parsing():
+    scraper = FurnitureScraper()
+    row = {
+        "Наименование": "Кресло Альфа",
+        "Описание": "ткань, газлифт",
+        "Размер": "600/600/900",
+        "Бюджет": "до 25 000 ₽",
+        "Ключевые слова": "кресло, ткань",
+    }
+    # эмуляция поведения pandas.Series
+    import pandas as pd
+
+    series = pd.Series(row)
+    assert scraper._pick_row_value(series, ["name", "наименование"]) == "Кресло Альфа"
+    assert scraper._parse_budget(series) == 25000
+
+
 async def _mock_scrape_site(site: str, query: str, budget: int | None = None):
     base = [
         {

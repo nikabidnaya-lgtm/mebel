@@ -50,6 +50,17 @@ PROXY=
 python scraper.py --excel input.xlsx --output output.xlsx --max-results 5
 ```
 
+По умолчанию скрипт использует **явно заданные локальные пути**:
+
+- вход: `data/input.xlsx`
+- выход: `data/output.xlsx`
+
+Можно запускать вообще без аргументов:
+
+```bash
+python scraper.py
+```
+
 ## Использование из Python
 
 ```python
