@@ -97,6 +97,7 @@ MARKET_CACHE_MAX_AGE_SECONDS = 24 * 60 * 60
 REPORT_FLUSH_EVERY = 25
 DEFAULT_RPC_BLOCK_CHUNK = 50000
 DEFAULT_RPC_START_BLOCK = 40000000
+DEFAULT_DISCOVERY_WORKERS = 8
 ADDRESS_REGEX = re.compile(r"0x[a-fA-F0-9]{40}")
 HEX_DATA_REGEX = re.compile(r"^(?:0x)?[0-9a-fA-F]+$")
 
@@ -625,6 +626,36 @@ def get_leaderboard(http_cache_dir: str, request_interval_seconds: float) -> Dic
     return dict(wallets)
 
 
+def get_public_trades_wallets(http_cache_dir: str, request_interval_seconds: float, discovery_workers: int) -> List[str]:
+    wallets: Set[str] = set()
+    offsets = list(range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT))
+    with ThreadPoolExecutor(max_workers=max(1, discovery_workers)) as executor:
+        future_map = {
+            executor.submit(fetch_trades_page, None, offset, http_cache_dir, request_interval_seconds): offset
+            for offset in offsets
+        }
+        progress = tqdm(total=len(future_map), desc="Public trades")
+        for future in as_completed(future_map):
+            rows = future.result() or []
+            for trade in rows:
+                wallets.update(
+                    extract_wallets_from_object(
+                        {
+                            "proxyWallet": trade.get("proxyWallet"),
+                            "user": trade.get("user"),
+                            "wallet": trade.get("wallet"),
+                            "maker": trade.get("maker"),
+                            "owner": trade.get("owner"),
+                            "taker": trade.get("taker"),
+                            "trader": trade.get("trader"),
+                        }
+                    )
+                )
+            progress.update(1)
+        progress.close()
+    return sorted(wallets)
+
+
 def fetch_trades_page(user: Optional[str], offset: int, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
     payload = request_json_or_empty("GET", f"{DATA_API_BASE}/trades", params={"limit": TRADES_PAGE_LIMIT, "offset": min(offset, TRADES_MAX_OFFSET), **({"user": user} if user else {})}, cache_dir=http_cache_dir, cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS, request_interval_seconds=request_interval_seconds)
     return unwrap_list_payload(payload, ("trades", "data", "results"))
@@ -661,13 +692,27 @@ def fetch_closed_positions(wallet: str, http_cache_dir: str, request_interval_se
     return records
 
 
-def fetch_subgraph_wallets(url: str, entity_candidates: List[str], max_pages: int, http_cache_dir: str, request_interval_seconds: float) -> List[str]:
+def fetch_subgraph_wallets(url: str, entity_candidates: List[str], max_pages: int, http_cache_dir: str, request_interval_seconds: float, discovery_workers: int) -> List[str]:
     if max_pages <= 0 or not url:
         return []
     if not is_graphql_endpoint_available(url, http_cache_dir, request_interval_seconds):
         return []
     query_fields = graphql_introspect_query_fields(url, http_cache_dir, request_interval_seconds)
-    wallet_field_candidates = ["user", "owner", "account", "proxyWallet", "maker", "taker", "stakeholder", "redeemer"]
+    wallet_field_candidates = [
+        "user",
+        "owner",
+        "account",
+        "proxyWallet",
+        "maker",
+        "taker",
+        "stakeholder",
+        "redeemer",
+        "recipient",
+        "sender",
+        "wallet",
+        "userAddress",
+        "trader",
+    ]
     entity_name = None
     query = ""
     selected_wallet_fields: List[str] = []
@@ -701,22 +746,35 @@ def fetch_subgraph_wallets(url: str, entity_candidates: List[str], max_pages: in
         return []
 
     wallets: Set[str] = set()
-    for page_index in tqdm(range(max_pages), desc=f"Subgraph {entity_name}"):
-        payload = graphql_query(url, query, {"first": SUBGRAPH_PAGE_SIZE, "skip": page_index * SUBGRAPH_PAGE_SIZE}, cache_dir=http_cache_dir, cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS, request_interval_seconds=request_interval_seconds)
-        rows = payload.get("data", {}).get(entity_name, []) if isinstance(payload, dict) else []
-        if not rows:
-            break
-        for row in rows:
-            for field_name in selected_wallet_fields:
-                wallet = normalize_wallet(row.get(field_name))
-                if wallet:
-                    wallets.add(wallet)
-        if len(rows) < SUBGRAPH_PAGE_SIZE:
-            break
+    with ThreadPoolExecutor(max_workers=max(1, discovery_workers)) as executor:
+        future_map = {
+            executor.submit(
+                graphql_query,
+                url,
+                query,
+                {"first": SUBGRAPH_PAGE_SIZE, "skip": page_index * SUBGRAPH_PAGE_SIZE},
+                cache_dir=http_cache_dir,
+                cache_ttl_seconds=DEFAULT_HTTP_CACHE_TTL_SECONDS,
+                request_interval_seconds=request_interval_seconds,
+            ): page_index
+            for page_index in range(max_pages)
+        }
+        progress = tqdm(total=len(future_map), desc=f"Subgraph {entity_name}")
+        for future in as_completed(future_map):
+            payload = future.result()
+            rows = payload.get("data", {}).get(entity_name, []) if isinstance(payload, dict) else []
+            for row in rows:
+                for field_name in selected_wallet_fields:
+                    wallet = normalize_wallet(row.get(field_name))
+                    if wallet:
+                        wallets.add(wallet)
+                wallets.update(extract_wallets_from_object(row))
+            progress.update(1)
+        progress.close()
     return sorted(wallets)
 
 
-def fetch_activity_subgraph_wallets(http_cache_dir: str, request_interval_seconds: float, max_pages: int) -> List[str]:
+def fetch_activity_subgraph_wallets(http_cache_dir: str, request_interval_seconds: float, max_pages: int, discovery_workers: int) -> List[str]:
     if not ACTIVITY_SUBGRAPH_URL:
         LOGGER.info("Activity subgraph scan skipped because POLYMARKET_ACTIVITY_SUBGRAPH_URL is not configured.")
         return []
@@ -729,7 +787,7 @@ def fetch_activity_subgraph_wallets(http_cache_dir: str, request_interval_second
         "positionsConvertedEvents",
         "activities",
     ]
-    return fetch_subgraph_wallets(ACTIVITY_SUBGRAPH_URL, entity_candidates, max_pages, http_cache_dir, request_interval_seconds)
+    return fetch_subgraph_wallets(ACTIVITY_SUBGRAPH_URL, entity_candidates, max_pages, http_cache_dir, request_interval_seconds, discovery_workers)
 
 
 def fetch_wallet_trades_subgraph(wallet: str, cutoff_ts: int, http_cache_dir: str, request_interval_seconds: float) -> List[Dict[str, Any]]:
@@ -888,31 +946,25 @@ def scan_contract_logs_for_wallets(rpc_url: str, contract_addresses: Iterable[st
     return sorted(wallets)
 
 
-def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pages: int, http_cache_dir: str, request_interval_seconds: float, dune_query_id: int, dune_api_key: str, polygon_rpc_url: str, rpc_start_block: int, rpc_end_block: int, rpc_block_chunk: int, enable_activity_subgraph_scan: bool, enable_topic_rpc_scan: bool, rpc_event_topics: Sequence[str], rpc_topic_eoa_only: bool, rpc_topic_classify_addresses: bool, enable_broad_rpc_scan: bool) -> List[Dict[str, Any]]:
+def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pages: int, http_cache_dir: str, request_interval_seconds: float, dune_query_id: int, dune_api_key: str, polygon_rpc_url: str, rpc_start_block: int, rpc_end_block: int, rpc_block_chunk: int, enable_activity_subgraph_scan: bool, enable_topic_rpc_scan: bool, rpc_event_topics: Sequence[str], rpc_topic_eoa_only: bool, rpc_topic_classify_addresses: bool, enable_broad_rpc_scan: bool, discovery_workers: int) -> List[Dict[str, Any]]:
     source_counts: Dict[str, int] = defaultdict(int)
     source_details: Dict[str, Any] = {}
     wallets_map = get_leaderboard(http_cache_dir, request_interval_seconds)
     source_counts["leaderboard"] = len(wallets_map)
     LOGGER.info("Collected %s unique wallets from leaderboard", len(wallets_map))
     if not leaderboard_only:
-        for offset in tqdm(range(0, TRADES_MAX_OFFSET + TRADES_PAGE_LIMIT, TRADES_PAGE_LIMIT), desc="Public trades"):
-            rows = fetch_trades_page(None, offset, http_cache_dir, request_interval_seconds)
-            if not rows:
-                break
-            for trade in rows:
-                wallet = normalize_wallet(trade.get("proxyWallet") or trade.get("user") or trade.get("wallet") or trade.get("maker") or trade.get("owner"))
-                if wallet and wallet not in wallets_map:
-                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                    source_counts["public_trades"] += 1
-            if len(rows) < TRADES_PAGE_LIMIT:
-                break
+        public_trade_wallets = get_public_trades_wallets(http_cache_dir, request_interval_seconds, discovery_workers)
+        for wallet in public_trade_wallets:
+            if wallet not in wallets_map:
+                wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
+                source_counts["public_trades"] += 1
         subgraph_sources = [
             (ORDERBOOK_SUBGRAPH_URL, "orderbook", ["orderFilledEvents", "ordersMatchedEvents", "orderFilledEvent", "ordersMatchedEvent", "marketData"]),
             (PNL_SUBGRAPH_URL, "pnl", ["userPositions", "userPosition"]),
             (POSITIONS_SUBGRAPH_URL, "positions", ["userBalances", "netUserBalances", "userBalance", "netUserBalance"]),
         ]
         if enable_activity_subgraph_scan:
-            discovered = fetch_activity_subgraph_wallets(http_cache_dir, request_interval_seconds, subgraph_wallet_pages)
+            discovered = fetch_activity_subgraph_wallets(http_cache_dir, request_interval_seconds, subgraph_wallet_pages, discovery_workers)
             added = 0
             for wallet in discovered:
                 if wallet not in wallets_map:
@@ -920,7 +972,7 @@ def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pag
                     added += 1
             source_counts["subgraph_activity"] = added
         for url, label, entity_candidates in subgraph_sources:
-            discovered = fetch_subgraph_wallets(url, entity_candidates, subgraph_wallet_pages, http_cache_dir, request_interval_seconds)
+            discovered = fetch_subgraph_wallets(url, entity_candidates, subgraph_wallet_pages, http_cache_dir, request_interval_seconds, discovery_workers)
             added = 0
             for wallet in discovered:
                 if wallet not in wallets_map:
@@ -1174,6 +1226,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--per_worker_memory_mb", type=int, default=DEFAULT_PER_WORKER_MEMORY_MB)
     parser.add_argument("--subgraph_wallet_pages", type=int, default=DEFAULT_SUBGRAPH_WALLET_PAGES)
     parser.add_argument("--request_interval_seconds", type=float, default=DEFAULT_REQUEST_INTERVAL_SECONDS)
+    parser.add_argument("--discovery_workers", type=int, default=0, help="Workers for wallet discovery scans; 0 = derive from analysis workers")
     parser.add_argument("--dune_query_id", type=int, default=0)
     parser.add_argument("--dune_api_key", type=str, default=os.getenv("DUNE_API_KEY", ""))
     parser.add_argument("--polygon_rpc_url", type=str, default=os.getenv("POLYGON_RPC_URL", ""))
@@ -1202,14 +1255,15 @@ def main() -> None:
     ACTIVITY_SUBGRAPH_URL = args.activity_subgraph_url.strip()
     system_profile = detect_system_profile()
     workers = choose_worker_count(system_profile, args.workers, args.max_cpu_percent, args.max_mem_percent, args.per_worker_memory_mb)
+    discovery_workers = max(1, args.discovery_workers or min(max(4, workers), DEFAULT_DISCOVERY_WORKERS))
     effective_rpc_end_block = args.rpc_end_block
     if args.polygon_rpc_url and effective_rpc_end_block <= 0:
         latest_block_hex = rpc_call(args.polygon_rpc_url, "eth_blockNumber", [], args.request_interval_seconds)
         effective_rpc_end_block = int(latest_block_hex, 16) if isinstance(latest_block_hex, str) and latest_block_hex.startswith("0x") else args.rpc_start_block
     LOGGER.info("Starting Polymarket analyzer")
-    LOGGER.info("System profile: cpu_count=%s total_memory_gb=%s chosen_workers=%s", system_profile.get("cpu_count"), system_profile.get("total_memory_gb"), workers)
+    LOGGER.info("System profile: cpu_count=%s total_memory_gb=%s chosen_workers=%s discovery_workers=%s", system_profile.get("cpu_count"), system_profile.get("total_memory_gb"), workers, discovery_workers)
     enable_activity_subgraph_scan = args.enable_activity_subgraph_scan and not args.disable_activity_subgraph_scan
-    wallets = collect_wallets(output_dir=output_dir, leaderboard_only=args.leaderboard_only, subgraph_wallet_pages=args.subgraph_wallet_pages, http_cache_dir=http_cache_dir, request_interval_seconds=args.request_interval_seconds, dune_query_id=args.dune_query_id, dune_api_key=args.dune_api_key, polygon_rpc_url=args.polygon_rpc_url, rpc_start_block=args.rpc_start_block, rpc_end_block=effective_rpc_end_block, rpc_block_chunk=args.rpc_block_chunk, enable_activity_subgraph_scan=enable_activity_subgraph_scan, enable_topic_rpc_scan=not args.disable_topic_rpc_scan, rpc_event_topics=args.rpc_event_topic, rpc_topic_eoa_only=args.rpc_topic_eoa_only, rpc_topic_classify_addresses=not args.no_rpc_topic_classify_addresses, enable_broad_rpc_scan=not args.disable_broad_rpc_scan)
+    wallets = collect_wallets(output_dir=output_dir, leaderboard_only=args.leaderboard_only, subgraph_wallet_pages=args.subgraph_wallet_pages, http_cache_dir=http_cache_dir, request_interval_seconds=args.request_interval_seconds, dune_query_id=args.dune_query_id, dune_api_key=args.dune_api_key, polygon_rpc_url=args.polygon_rpc_url, rpc_start_block=args.rpc_start_block, rpc_end_block=effective_rpc_end_block, rpc_block_chunk=args.rpc_block_chunk, enable_activity_subgraph_scan=enable_activity_subgraph_scan, enable_topic_rpc_scan=not args.disable_topic_rpc_scan, rpc_event_topics=args.rpc_event_topic, rpc_topic_eoa_only=args.rpc_topic_eoa_only, rpc_topic_classify_addresses=not args.no_rpc_topic_classify_addresses, enable_broad_rpc_scan=not args.disable_broad_rpc_scan, discovery_workers=discovery_workers)
     LOGGER.info("Wallet collection completed with %s wallets", len(wallets))
     results = analyze_wallets(wallets=wallets, output_dir=output_dir, period_days=args.period_days, max_wallets=args.max_wallets, use_subgraph=args.use_subgraph, workers=workers, request_interval_seconds=args.request_interval_seconds)
     LOGGER.info("Analysis completed with %s profitable candidate wallets", len(results))
