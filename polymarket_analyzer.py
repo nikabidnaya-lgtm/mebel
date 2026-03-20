@@ -57,6 +57,9 @@ ORDERBOOK_SUBGRAPH_URL = (
 )
 ACTIVITY_SUBGRAPH_URL = os.getenv("POLYMARKET_ACTIVITY_SUBGRAPH_URL", "")
 DUNE_API_BASE = "https://api.dune.com/api/v1"
+COVALENT_API_BASE = "https://api.covalenthq.com/v1"
+BITQUERY_API_URL = "https://graphql.bitquery.io"
+BIGQUERY_API_BASE = "https://bigquery.googleapis.com/bigquery/v2"
 
 DEFAULT_HEADERS = {
     "Accept": "application/json",
@@ -108,6 +111,15 @@ POLYMARKET_CONTRACTS = {
     "neg_risk_adapter": "0xd91e80cf2e7be2e162c6513ced06f1dd0da35296",
     "polymarket_proxy_factory": "0xab45c5a4b0c941a2f231c04c3f49182e1a254052",
     "gnosis_safe_factory": "0xaacfeea03eb1561c4e67d661e40682bd20e3541b",
+}
+
+DEFAULT_INFRA_LABELS = {
+    POLYMARKET_CONTRACTS["ctf_exchange"]: "polymarket_contract",
+    POLYMARKET_CONTRACTS["neg_risk_ctf_exchange"]: "polymarket_contract",
+    POLYMARKET_CONTRACTS["ctf"]: "polymarket_contract",
+    POLYMARKET_CONTRACTS["neg_risk_adapter"]: "polymarket_contract",
+    POLYMARKET_CONTRACTS["polymarket_proxy_factory"]: "factory",
+    POLYMARKET_CONTRACTS["gnosis_safe_factory"]: "factory",
 }
 
 DEFAULT_RPC_EVENT_CONFIG = {
@@ -319,6 +331,57 @@ def parse_topic_hashes(raw: str) -> List[str]:
     if not raw:
         return []
     return [item.strip().lower() for item in raw.split(",") if item.strip()]
+
+
+def ethereum_keccak256(text: str) -> str:
+    import importlib
+
+    for module_name in ("Crypto.Hash.keccak", "sha3"):
+        try:
+            module = importlib.import_module(module_name)
+            if module_name == "Crypto.Hash.keccak":
+                digest = module.new(digest_bits=256)
+                digest.update(text.encode("utf-8"))
+                return "0x" + digest.hexdigest()
+            digest = module.keccak_256()
+            digest.update(text.encode("utf-8"))
+            return "0x" + digest.hexdigest()
+        except Exception:
+            continue
+    LOGGER.warning("Falling back to sha3_256 for topic hashing because a keccak implementation is unavailable.")
+    return "0x" + hashlib.sha3_256(text.encode("utf-8")).hexdigest()
+
+
+def topic_hash_for_signature(signature: str) -> str:
+    return ethereum_keccak256(signature.strip())
+
+
+def build_default_topic_hashes() -> None:
+    signature_map = {
+        "order_filled": "OrderFilled(bytes32,address,address,uint256,uint256,uint256,uint256,uint256)",
+        "orders_matched": "OrdersMatched(bytes32,address,bytes32,address,uint256,uint256,uint256,uint256,uint256)",
+        "position_split": "PositionSplit(address,address,bytes32,bytes32,uint256[],uint256)",
+        "positions_merge": "PositionsMerge(address,address,bytes32,bytes32,uint256[],uint256)",
+        "payout_redemption": "PayoutRedemption(address,address,bytes32,bytes32,uint256[],uint256)",
+        "positions_converted": "PositionsConverted(address,bytes32,uint256,uint256)",
+    }
+    for event_name, signature in signature_map.items():
+        config = DEFAULT_RPC_EVENT_CONFIG.get(event_name)
+        if config is not None and not parse_topic_hashes(str(config.get("topic0") or "")):
+            config["topic0"] = topic_hash_for_signature(signature)
+
+
+def infer_block_number(item: Dict[str, Any]) -> Optional[int]:
+    for field in ("blockNumber", "block_height", "blockHeight", "block"):
+        value = item.get(field)
+        if value is None:
+            continue
+        if isinstance(value, str) and value.startswith("0x"):
+            return hex_to_int(value)
+        parsed = parse_int(value, -1)
+        if parsed >= 0:
+            return parsed
+    return None
 
 
 def extract_timestamp(item: Dict[str, Any]) -> Optional[int]:
@@ -946,18 +1009,192 @@ def scan_contract_logs_for_wallets(rpc_url: str, contract_addresses: Iterable[st
     return sorted(wallets)
 
 
-def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pages: int, http_cache_dir: str, request_interval_seconds: float, dune_query_id: int, dune_api_key: str, polygon_rpc_url: str, rpc_start_block: int, rpc_end_block: int, rpc_block_chunk: int, enable_activity_subgraph_scan: bool, enable_topic_rpc_scan: bool, rpc_event_topics: Sequence[str], rpc_topic_eoa_only: bool, rpc_topic_classify_addresses: bool, enable_broad_rpc_scan: bool, discovery_workers: int) -> List[Dict[str, Any]]:
+def make_wallet_entry(wallet: str) -> Dict[str, Any]:
+    return {
+        "wallet": wallet,
+        "volume_usd": 0.0,
+        "pnl_usd": 0.0,
+        "firstSeenBlock": None,
+        "lastSeenBlock": None,
+        "participationType": [],
+        "sources": [],
+        "labels": [],
+        "classifications": [],
+    }
+
+
+def merge_wallet_metadata(entry: Dict[str, Any], *, block_number: Optional[int] = None, source: Optional[str] = None, participation_types: Optional[Iterable[str]] = None, labels: Optional[Iterable[str]] = None, classification: Optional[str] = None, volume_usd: float = 0.0, pnl_usd: float = 0.0) -> None:
+    if block_number is not None:
+        current_first = entry.get("firstSeenBlock")
+        current_last = entry.get("lastSeenBlock")
+        entry["firstSeenBlock"] = block_number if current_first is None else min(int(current_first), block_number)
+        entry["lastSeenBlock"] = block_number if current_last is None else max(int(current_last), block_number)
+    if source:
+        entry["sources"] = sorted(set(entry.get("sources", [])) | {source})
+    if participation_types:
+        entry["participationType"] = sorted(set(entry.get("participationType", [])) | {item for item in participation_types if item})
+    if labels:
+        entry["labels"] = sorted(set(entry.get("labels", [])) | {item for item in labels if item})
+    if classification:
+        entry["classifications"] = sorted(set(entry.get("classifications", [])) | {classification})
+    if volume_usd > 0:
+        entry["volume_usd"] = max(parse_float(entry.get("volume_usd")), volume_usd)
+    if pnl_usd:
+        entry["pnl_usd"] = max(parse_float(entry.get("pnl_usd")), pnl_usd)
+
+
+def extract_wallet_metadata_from_log(log: Dict[str, Any], source: str, participation_type: str) -> List[Tuple[str, Dict[str, Any]]]:
+    block_number = infer_block_number(log)
+    pairs: List[Tuple[str, Dict[str, Any]]] = []
+    for wallet in extract_wallets_from_object(log):
+        labels = []
+        if wallet in DEFAULT_INFRA_LABELS:
+            labels.append(DEFAULT_INFRA_LABELS[wallet])
+        pairs.append((wallet, {"block_number": block_number, "source": source, "participation_types": [participation_type], "labels": labels}))
+    return pairs
+
+
+def fetch_covalent_event_wallets(rpc_chain_id: int, event_specs: List[Dict[str, Any]], api_key: str, http_cache_dir: str, request_interval_seconds: float) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+    if not api_key:
+        return [], {}
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    stats: Dict[str, Any] = {}
+    for spec in event_specs:
+        event_rows = 0
+        for contract_key in spec.get("contract_keys", []):
+            contract_address = POLYMARKET_CONTRACTS.get(contract_key)
+            if not contract_address:
+                continue
+            for topic_hash in spec.get("topic_hashes", []):
+                payload = request_json_or_empty(
+                    "GET",
+                    f"{COVALENT_API_BASE}/{rpc_chain_id}/events/address/{contract_address}/",
+                    params={"key": api_key, "starting-block": 0, "ending-block": "latest", "page-size": 1000, "page-number": 0, "topic": topic_hash},
+                    cache_dir=http_cache_dir,
+                    cache_ttl_seconds=12 * 60 * 60,
+                    request_interval_seconds=request_interval_seconds,
+                )
+                rows = payload.get("data", {}).get("items", []) if isinstance(payload, dict) else []
+                event_rows += len(rows)
+                for row in rows:
+                    block_number = infer_block_number(row)
+                    for topic_position in spec.get("indexed_address_positions", []):
+                        topics = row.get("raw_log_topics") or row.get("topics") or []
+                        if topic_position >= len(topics):
+                            continue
+                        wallet = decode_indexed_address(topics[topic_position])
+                        if wallet:
+                            results.append((wallet, {"block_number": block_number, "source": "covalent", "participation_types": [spec["name"]]}))
+        stats[spec["name"]] = {"rows": event_rows}
+    return results, stats
+
+
+def fetch_bitquery_event_wallets(event_specs: List[Dict[str, Any]], api_key: str, http_cache_dir: str, request_interval_seconds: float) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+    if not api_key:
+        return [], {}
+    query = """
+    query EventLogs($network: evm_network!, $addresses: [String!], $topics: [String!]) {
+      EVM(network: $network) {
+        Logs(where: {Log: {Address: {in: $addresses}, Signature: {in: $topics}}}, limit: {count: 10000}) {
+          Log {
+            Address
+            Signature
+            Topics
+          }
+          Block {
+            Number
+          }
+        }
+      }
+    }
+    """
+    headers = {"Authorization": f"Bearer {api_key}"}
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    stats: Dict[str, Any] = {}
+    for spec in event_specs:
+        addresses = [POLYMARKET_CONTRACTS[key] for key in spec.get("contract_keys", []) if key in POLYMARKET_CONTRACTS]
+        payload = request_json_or_empty(
+            "POST",
+            BITQUERY_API_URL,
+            json_payload={"query": query, "variables": {"network": "polygon", "addresses": addresses, "topics": spec.get("topic_hashes", [])}},
+            headers=headers,
+            cache_dir=http_cache_dir,
+            cache_ttl_seconds=12 * 60 * 60,
+            request_interval_seconds=request_interval_seconds,
+        )
+        rows = payload.get("data", {}).get("EVM", {}).get("Logs", []) if isinstance(payload, dict) else []
+        stats[spec["name"]] = {"rows": len(rows)}
+        for row in rows:
+            topics = row.get("Log", {}).get("Topics") or []
+            block_number = infer_block_number({"blockNumber": row.get("Block", {}).get("Number")})
+            for topic_position in spec.get("indexed_address_positions", []):
+                if topic_position >= len(topics):
+                    continue
+                wallet = decode_indexed_address(topics[topic_position])
+                if wallet:
+                    results.append((wallet, {"block_number": block_number, "source": "bitquery", "participation_types": [spec["name"]]}))
+    return results, stats
+
+
+def fetch_bigquery_wallets(project_id: str, sql: str, access_token: str, http_cache_dir: str, request_interval_seconds: float) -> Tuple[List[Tuple[str, Dict[str, Any]]], Dict[str, Any]]:
+    if not (project_id and sql and access_token):
+        return [], {}
+    payload = request_json_or_empty(
+        "POST",
+        f"{BIGQUERY_API_BASE}/projects/{project_id}/queries",
+        headers={"Authorization": f"Bearer {access_token}", "Content-Type": "application/json"},
+        json_payload={"query": sql, "useLegacySql": False, "maxResults": 10000},
+        cache_dir=http_cache_dir,
+        cache_ttl_seconds=12 * 60 * 60,
+        request_interval_seconds=request_interval_seconds,
+    )
+    schema_fields = payload.get("schema", {}).get("fields", []) if isinstance(payload, dict) else []
+    rows = payload.get("rows", []) if isinstance(payload, dict) else []
+    field_names = [field.get("name") for field in schema_fields]
+    results: List[Tuple[str, Dict[str, Any]]] = []
+    for row in rows:
+        values = [item.get("v") for item in row.get("f", [])]
+        row_map = dict(zip(field_names, values))
+        wallets = extract_wallets_from_object(row_map)
+        block_number = infer_block_number(row_map)
+        participation_types = [str(row_map.get("participationType") or row_map.get("event_name") or "bigquery")]
+        for wallet in wallets:
+            results.append((wallet, {"block_number": block_number, "source": "bigquery", "participation_types": participation_types}))
+    return results, {"rows": len(rows)}
+
+
+def should_exclude_wallet(entry: Dict[str, Any], include_contracts: bool) -> bool:
+    labels = set(entry.get("labels", []))
+    classifications = set(entry.get("classifications", []))
+    if "polymarket_contract" in labels or "factory" in labels:
+        return True
+    if not include_contracts and "contract" in classifications:
+        return True
+    return False
+
+
+def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pages: int, http_cache_dir: str, request_interval_seconds: float, dune_query_id: int, dune_api_key: str, polygon_rpc_url: str, rpc_start_block: int, rpc_end_block: int, rpc_block_chunk: int, enable_activity_subgraph_scan: bool, enable_topic_rpc_scan: bool, rpc_event_topics: Sequence[str], rpc_topic_eoa_only: bool, rpc_topic_classify_addresses: bool, enable_broad_rpc_scan: bool, discovery_workers: int, covalent_api_key: str, bitquery_api_key: str, bigquery_project_id: str, bigquery_sql: str, bigquery_access_token: str, include_contract_wallets: bool) -> List[Dict[str, Any]]:
     source_counts: Dict[str, int] = defaultdict(int)
     source_details: Dict[str, Any] = {}
     wallets_map = get_leaderboard(http_cache_dir, request_interval_seconds)
-    source_counts["leaderboard"] = len(wallets_map)
-    LOGGER.info("Collected %s unique wallets from leaderboard", len(wallets_map))
+    wallet_records: Dict[str, Dict[str, Any]] = {wallet: {**make_wallet_entry(wallet), **row} for wallet, row in wallets_map.items()}
+
+    def add_wallet(wallet: str, *, source: str, block_number: Optional[int] = None, participation_types: Optional[Iterable[str]] = None, labels: Optional[Iterable[str]] = None, classification: Optional[str] = None, volume_usd: float = 0.0, pnl_usd: float = 0.0) -> None:
+        if not wallet:
+            return
+        entry = wallet_records.setdefault(wallet, make_wallet_entry(wallet))
+        is_new = source not in entry.get("sources", [])
+        merge_wallet_metadata(entry, block_number=block_number, source=source, participation_types=participation_types, labels=labels, classification=classification, volume_usd=volume_usd, pnl_usd=pnl_usd)
+        if is_new:
+            source_counts[source] += 1
+
+    for wallet, row in wallets_map.items():
+        add_wallet(wallet, source="leaderboard", volume_usd=parse_float(row.get("volume_usd")), pnl_usd=parse_float(row.get("pnl_usd")), participation_types=["leaderboard"])
+    LOGGER.info("Collected %s unique wallets from leaderboard", len(wallet_records))
     if not leaderboard_only:
         public_trade_wallets = get_public_trades_wallets(http_cache_dir, request_interval_seconds, discovery_workers)
         for wallet in public_trade_wallets:
-            if wallet not in wallets_map:
-                wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                source_counts["public_trades"] += 1
+            add_wallet(wallet, source="public_trades", participation_types=["trade"])
         subgraph_sources = [
             (ORDERBOOK_SUBGRAPH_URL, "orderbook", ["orderFilledEvents", "ordersMatchedEvents", "orderFilledEvent", "ordersMatchedEvent", "marketData"]),
             (PNL_SUBGRAPH_URL, "pnl", ["userPositions", "userPosition"]),
@@ -965,58 +1202,56 @@ def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pag
         ]
         if enable_activity_subgraph_scan:
             discovered = fetch_activity_subgraph_wallets(http_cache_dir, request_interval_seconds, subgraph_wallet_pages, discovery_workers)
-            added = 0
             for wallet in discovered:
-                if wallet not in wallets_map:
-                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                    added += 1
-            source_counts["subgraph_activity"] = added
+                add_wallet(wallet, source="subgraph_activity", participation_types=["activity_subgraph"])
         for url, label, entity_candidates in subgraph_sources:
             discovered = fetch_subgraph_wallets(url, entity_candidates, subgraph_wallet_pages, http_cache_dir, request_interval_seconds, discovery_workers)
-            added = 0
             for wallet in discovered:
-                if wallet not in wallets_map:
-                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                    added += 1
-            source_counts[f"subgraph_{label}"] = added
+                add_wallet(wallet, source=f"subgraph_{label}", participation_types=[label])
         if dune_query_id > 0 and dune_api_key:
             dune_wallets = fetch_dune_wallets(http_cache_dir, request_interval_seconds, dune_query_id, dune_api_key)
-            added = 0
             for wallet in dune_wallets:
-                if wallet not in wallets_map:
-                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                    added += 1
-            source_counts["dune"] = added
+                add_wallet(wallet, source="dune", participation_types=["dune"])
         if polygon_rpc_url and enable_topic_rpc_scan:
             event_specs = resolve_event_scan_specs(rpc_event_topics)
             if event_specs:
                 rpc_wallets, rpc_stats = scan_logs_by_event_topics(polygon_rpc_url, rpc_start_block, rpc_end_block, rpc_block_chunk, request_interval_seconds, event_specs, rpc_topic_classify_addresses, rpc_topic_eoa_only)
-                added = 0
                 for wallet in rpc_wallets:
-                    if wallet not in wallets_map:
-                        wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                        added += 1
-                source_counts["rpc_event_topics"] = added
+                    classification = get_code_classification(polygon_rpc_url, wallet, request_interval_seconds, {}, threading.Lock()) if rpc_topic_classify_addresses else None
+                    labels = [DEFAULT_INFRA_LABELS[wallet]] if wallet in DEFAULT_INFRA_LABELS else []
+                    add_wallet(wallet, source="rpc_event_topics", participation_types=["event_topic_scan"], labels=labels, classification=classification)
                 source_details["rpc_event_topics"] = rpc_stats
-                LOGGER.info("Added %s wallets from event-topic RPC scan", added)
             else:
                 LOGGER.warning("Topic RPC scan enabled but no event topic hashes were configured. Provide env vars or --rpc_event_topic entries.")
         if polygon_rpc_url and enable_broad_rpc_scan:
             rpc_wallets = scan_contract_logs_for_wallets(polygon_rpc_url, [POLYMARKET_CONTRACTS["ctf_exchange"], POLYMARKET_CONTRACTS["neg_risk_ctf_exchange"], POLYMARKET_CONTRACTS["ctf"], POLYMARKET_CONTRACTS["neg_risk_adapter"], POLYMARKET_CONTRACTS["polymarket_proxy_factory"], POLYMARKET_CONTRACTS["gnosis_safe_factory"]], rpc_start_block, rpc_end_block, rpc_block_chunk, request_interval_seconds)
-            added = 0
             for wallet in rpc_wallets:
-                if wallet not in wallets_map:
-                    wallets_map[wallet] = {"wallet": wallet, "volume_usd": 0.0, "pnl_usd": 0.0}
-                    added += 1
-            source_counts["raw_rpc_logs"] = added
-            LOGGER.info("Added %s wallets from raw Polygon RPC log scan", added)
-    wallets = [item for item in wallets_map.values() if normalize_wallet(item.get("wallet"))]
+                labels = [DEFAULT_INFRA_LABELS[wallet]] if wallet in DEFAULT_INFRA_LABELS else []
+                add_wallet(wallet, source="raw_rpc_logs", participation_types=["broad_rpc_scan"], labels=labels)
+        event_specs = resolve_event_scan_specs(rpc_event_topics)
+        covalent_wallets, covalent_stats = fetch_covalent_event_wallets(137, event_specs, covalent_api_key, http_cache_dir, request_interval_seconds)
+        for wallet, meta in covalent_wallets:
+            add_wallet(wallet, source="covalent", block_number=meta.get("block_number"), participation_types=meta.get("participation_types"))
+        if covalent_stats:
+            source_details["covalent"] = covalent_stats
+        bitquery_wallets, bitquery_stats = fetch_bitquery_event_wallets(event_specs, bitquery_api_key, http_cache_dir, request_interval_seconds)
+        for wallet, meta in bitquery_wallets:
+            add_wallet(wallet, source="bitquery", block_number=meta.get("block_number"), participation_types=meta.get("participation_types"))
+        if bitquery_stats:
+            source_details["bitquery"] = bitquery_stats
+        bigquery_wallets, bigquery_stats = fetch_bigquery_wallets(bigquery_project_id, bigquery_sql, bigquery_access_token, http_cache_dir, request_interval_seconds)
+        for wallet, meta in bigquery_wallets:
+            add_wallet(wallet, source="bigquery", block_number=meta.get("block_number"), participation_types=meta.get("participation_types"))
+        if bigquery_stats:
+            source_details["bigquery"] = bigquery_stats
+    wallets = [item for item in wallet_records.values() if normalize_wallet(item.get("wallet")) and not should_exclude_wallet(item, include_contract_wallets)]
     wallets.sort(key=lambda item: (parse_float(item.get("volume_usd")), parse_float(item.get("pnl_usd"))), reverse=True)
     with open(os.path.join(output_dir, "wallets.csv"), "w", newline="", encoding="utf-8") as fh:
         writer = csv.DictWriter(fh, fieldnames=["wallet", "volume_usd", "pnl_usd"])
         writer.writeheader()
         writer.writerows(wallets)
     save_json(os.path.join(output_dir, "wallet_sources.json"), {"counts": dict(source_counts), "details": source_details})
+    save_json(os.path.join(output_dir, "wallet_participants.json"), wallets)
     LOGGER.info("Wallet source breakdown: %s", dict(source_counts))
     return wallets
 
@@ -1229,6 +1464,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--discovery_workers", type=int, default=0, help="Workers for wallet discovery scans; 0 = derive from analysis workers")
     parser.add_argument("--dune_query_id", type=int, default=0)
     parser.add_argument("--dune_api_key", type=str, default=os.getenv("DUNE_API_KEY", ""))
+    parser.add_argument("--covalent_api_key", type=str, default=os.getenv("COVALENT_API_KEY", ""))
+    parser.add_argument("--bitquery_api_key", type=str, default=os.getenv("BITQUERY_API_KEY", ""))
+    parser.add_argument("--bigquery_project_id", type=str, default=os.getenv("BIGQUERY_PROJECT_ID", ""))
+    parser.add_argument("--bigquery_sql", type=str, default=os.getenv("BIGQUERY_SQL", ""))
+    parser.add_argument("--bigquery_access_token", type=str, default=os.getenv("BIGQUERY_ACCESS_TOKEN", ""))
     parser.add_argument("--polygon_rpc_url", type=str, default=os.getenv("POLYGON_RPC_URL", ""))
     parser.add_argument("--rpc_start_block", type=int, default=DEFAULT_RPC_START_BLOCK)
     parser.add_argument("--rpc_end_block", type=int, default=0, help="0 = latest block at runtime")
@@ -1241,6 +1481,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--rpc_event_topic", action="append", default=[], help="Optional override in the form event_name=0xtopic or a plain 0xtopic hash to append")
     parser.add_argument("--rpc_topic_eoa_only", action="store_true", help="Keep only EOAs from event-topic RPC scans")
     parser.add_argument("--no_rpc_topic_classify_addresses", action="store_true", help="Do not call eth_getCode for event-topic RPC scan results")
+    parser.add_argument("--include_contract_wallets", action="store_true", help="Keep contract wallets in final outputs instead of excluding them")
     return parser
 
 
@@ -1253,6 +1494,7 @@ def main() -> None:
     LOGGER = setup_logging(output_dir)
     global ACTIVITY_SUBGRAPH_URL
     ACTIVITY_SUBGRAPH_URL = args.activity_subgraph_url.strip()
+    build_default_topic_hashes()
     system_profile = detect_system_profile()
     workers = choose_worker_count(system_profile, args.workers, args.max_cpu_percent, args.max_mem_percent, args.per_worker_memory_mb)
     discovery_workers = max(1, args.discovery_workers or min(max(4, workers), DEFAULT_DISCOVERY_WORKERS))
@@ -1263,7 +1505,7 @@ def main() -> None:
     LOGGER.info("Starting Polymarket analyzer")
     LOGGER.info("System profile: cpu_count=%s total_memory_gb=%s chosen_workers=%s discovery_workers=%s", system_profile.get("cpu_count"), system_profile.get("total_memory_gb"), workers, discovery_workers)
     enable_activity_subgraph_scan = args.enable_activity_subgraph_scan and not args.disable_activity_subgraph_scan
-    wallets = collect_wallets(output_dir=output_dir, leaderboard_only=args.leaderboard_only, subgraph_wallet_pages=args.subgraph_wallet_pages, http_cache_dir=http_cache_dir, request_interval_seconds=args.request_interval_seconds, dune_query_id=args.dune_query_id, dune_api_key=args.dune_api_key, polygon_rpc_url=args.polygon_rpc_url, rpc_start_block=args.rpc_start_block, rpc_end_block=effective_rpc_end_block, rpc_block_chunk=args.rpc_block_chunk, enable_activity_subgraph_scan=enable_activity_subgraph_scan, enable_topic_rpc_scan=not args.disable_topic_rpc_scan, rpc_event_topics=args.rpc_event_topic, rpc_topic_eoa_only=args.rpc_topic_eoa_only, rpc_topic_classify_addresses=not args.no_rpc_topic_classify_addresses, enable_broad_rpc_scan=not args.disable_broad_rpc_scan, discovery_workers=discovery_workers)
+    wallets = collect_wallets(output_dir=output_dir, leaderboard_only=args.leaderboard_only, subgraph_wallet_pages=args.subgraph_wallet_pages, http_cache_dir=http_cache_dir, request_interval_seconds=args.request_interval_seconds, dune_query_id=args.dune_query_id, dune_api_key=args.dune_api_key, polygon_rpc_url=args.polygon_rpc_url, rpc_start_block=args.rpc_start_block, rpc_end_block=effective_rpc_end_block, rpc_block_chunk=args.rpc_block_chunk, enable_activity_subgraph_scan=enable_activity_subgraph_scan, enable_topic_rpc_scan=not args.disable_topic_rpc_scan, rpc_event_topics=args.rpc_event_topic, rpc_topic_eoa_only=args.rpc_topic_eoa_only, rpc_topic_classify_addresses=not args.no_rpc_topic_classify_addresses, enable_broad_rpc_scan=not args.disable_broad_rpc_scan, discovery_workers=discovery_workers, covalent_api_key=args.covalent_api_key, bitquery_api_key=args.bitquery_api_key, bigquery_project_id=args.bigquery_project_id, bigquery_sql=args.bigquery_sql, bigquery_access_token=args.bigquery_access_token, include_contract_wallets=args.include_contract_wallets)
     LOGGER.info("Wallet collection completed with %s wallets", len(wallets))
     results = analyze_wallets(wallets=wallets, output_dir=output_dir, period_days=args.period_days, max_wallets=args.max_wallets, use_subgraph=args.use_subgraph, workers=workers, request_interval_seconds=args.request_interval_seconds)
     LOGGER.info("Analysis completed with %s profitable candidate wallets", len(results))
