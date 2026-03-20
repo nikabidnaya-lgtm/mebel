@@ -1247,9 +1247,11 @@ def collect_wallets(output_dir: str, leaderboard_only: bool, subgraph_wallet_pag
     wallets = [item for item in wallet_records.values() if normalize_wallet(item.get("wallet")) and not should_exclude_wallet(item, include_contract_wallets)]
     wallets.sort(key=lambda item: (parse_float(item.get("volume_usd")), parse_float(item.get("pnl_usd"))), reverse=True)
     with open(os.path.join(output_dir, "wallets.csv"), "w", newline="", encoding="utf-8") as fh:
-        writer = csv.DictWriter(fh, fieldnames=["wallet", "volume_usd", "pnl_usd"])
+        wallet_csv_fields = ["wallet", "volume_usd", "pnl_usd"]
+        writer = csv.DictWriter(fh, fieldnames=wallet_csv_fields)
         writer.writeheader()
-        writer.writerows(wallets)
+        for row in wallets:
+            writer.writerow({field: row.get(field) for field in wallet_csv_fields})
     save_json(os.path.join(output_dir, "wallet_sources.json"), {"counts": dict(source_counts), "details": source_details})
     save_json(os.path.join(output_dir, "wallet_participants.json"), wallets)
     LOGGER.info("Wallet source breakdown: %s", dict(source_counts))
